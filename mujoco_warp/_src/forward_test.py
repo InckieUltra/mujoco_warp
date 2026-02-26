@@ -28,6 +28,7 @@ from mujoco_warp import EnableBit
 from mujoco_warp import GainType
 from mujoco_warp import IntegratorType
 from mujoco_warp import test_data
+from mujoco_warp._src.util_pkg import check_version
 
 # tolerance for difference between MuJoCo and mjwarp smooth calculations - mostly
 # due to float precision
@@ -191,7 +192,7 @@ class ForwardTest(parameterized.TestCase):
     _assert_eq(rk_step().numpy()[0], rk_step().numpy()[0], "qpos")
 
   @parameterized.product(
-    jacobian=(mujoco.mjtJacobian.mjJAC_AUTO, mujoco.mjtJacobian.mjJAC_DENSE),
+    jacobian=(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE),
     actuation=(0, DisableBit.ACTUATION),
     spring=(0, DisableBit.SPRING),
     damper=(0, DisableBit.DAMPER),
@@ -225,10 +226,10 @@ class ForwardTest(parameterized.TestCase):
 
     m = mjw.put_model(mjm)
     d = mjw.put_data(mjm, mjd)
+    # compute efc.Ma - used by mjw.implicit
+    d.efc.Ma = wp.array(mjd.qfrc_constraint + mjd.qfrc_smooth, dtype=wp.float32, shape=(1, -1))
 
     mujoco.mj_implicit(mjm, mjd)
-
-    mjw.solve(m, d)  # compute efc.Ma
     mjw.implicit(m, d)
 
     _assert_eq(d.qpos.numpy()[0], mjd.qpos, "qpos")
@@ -377,6 +378,9 @@ class ForwardTest(parameterized.TestCase):
         # leave geom_xpos and geom_xmat untouched because they have static data
         continue
       attr, _ = _getattr(arr)
+      if arr in ("xquat", "xmat", "ximat"):
+        # xquat, xmat, ximat need to retain identity for world body
+        attr = attr[:, 1:]
       if attr.dtype == float:
         attr.fill_(wp.nan)
       elif attr.dtype == int:
@@ -387,8 +391,28 @@ class ForwardTest(parameterized.TestCase):
     mujoco.mj_step1(mjm, mjd)
     mjw.step1(m, d)
 
+    # Precompute sorting for efc fields to avoid non determinism
+    nefc = d.nefc.numpy()[0]
+    if nefc > 0:
+      nv = m.nv
+      d_efc_J = d.efc.J.numpy()[0, :nefc, :nv]
+      if mjd.efc_J.shape[0] != mjd.nefc * mjm.nv:
+        mjd_efc_J = np.zeros((mjd.nefc, mjm.nv))
+        mujoco.mju_sparse2dense(mjd_efc_J, mjd.efc_J, mjd.efc_J_rownnz, mjd.efc_J_rowadr, mjd.efc_J_colind)
+      else:
+        mjd_efc_J = mjd.efc_J.reshape((mjd.nefc, mjm.nv))
+
+      # Sort by efc_type, then efc_J columns (tiebreaker)
+      d_sort = np.lexsort((*d_efc_J.T, d.efc.type.numpy()[0, :nefc]))
+      mjd_sort = np.lexsort((*mjd_efc_J.T, mjd.efc_type[:nefc]))
+      _assert_eq(d_efc_J[d_sort].reshape(-1), mjd_efc_J[mjd_sort].reshape(-1), "efc_J")
+
+      # Check efc_id here as a contact may have a different id
+      _assert_eq(sorted(d.efc.id.numpy()[0, :nefc]), sorted(mjd.efc_id[:nefc]), "efc_id")
+
     for arr in step1_field:
-      d_arr, is_nefc = _getattr(arr)
+      d_arr, is_efc = _getattr(arr)
+
       d_arr = d_arr.numpy()[0]
       mjd_arr = getattr(mjd, arr)
       if arr in ["xmat", "ximat", "geom_xmat", "site_xmat", "cam_xmat"]:
@@ -398,22 +422,22 @@ class ForwardTest(parameterized.TestCase):
         qM = np.zeros((mjm.nv, mjm.nv))
         mujoco.mj_fullM(mjm, qM, mjd.qM)
         mjd_arr = qM
+        d_arr = d_arr[: mjm.nv, : mjm.nv]
       elif arr == "actuator_moment":
         actuator_moment = np.zeros((mjm.nu, mjm.nv))
         mujoco.mju_sparse2dense(actuator_moment, mjd.actuator_moment, mjd.moment_rownnz, mjd.moment_rowadr, mjd.moment_colind)
         mjd_arr = actuator_moment
-      elif arr == "ten_J" and mjm.ntendon:
-        ten_J = np.zeros((mjm.ntendon, mjm.nv))
-        mujoco.mju_sparse2dense(ten_J, mjd.ten_J, mjd.ten_J_rownnz, mjd.ten_J_rowadr, mjd.ten_J_colind)
-        mjd_arr = ten_J
-      elif arr == "efc_J":
-        d_arr = d_arr[:, : m.nv]  # efc_J is padded up to the next multiple of the tile size
-        if mjd.efc_J.shape[0] != mjd.nefc * mjm.nv:
-          efc_J = np.zeros((mjd.nefc, mjm.nv))
-          mujoco.mju_sparse2dense(efc_J, mjd.efc_J, mjd.efc_J_rownnz, mjd.efc_J_rowadr, mjd.efc_J_colind)
-          mjd_arr = efc_J
+      elif arr == "ten_J":
+        if check_version("mujoco>=3.5.1.dev872479828"):
+          ten_J = np.zeros((mjm.ntendon, mjm.nv))
+          if mjm.ntendon:
+            mujoco.mju_sparse2dense(ten_J, mjd.ten_J, mjd.ten_J_rownnz, mjd.ten_J_rowadr, mjd.ten_J_colind)
+          mjd_arr = ten_J
         else:
-          mjd_arr = mjd_arr.reshape((mjd.nefc, mjm.nv))
+          mjd_arr = mjd.ten_J.reshape((mjm.ntendon, mjm.nv))
+      elif arr == "efc_J" or arr == "efc_id":
+        # Already checked earlier
+        continue
       elif arr == "qLD":
         vec = np.ones((1, mjm.nv))
         res = np.zeros((1, mjm.nv))
@@ -425,8 +449,13 @@ class ForwardTest(parameterized.TestCase):
 
         d_arr = res_wp.numpy()[0]
         mjd_arr = res[0]
-      if is_nefc:
-        d_arr = d_arr[: d.nefc.numpy()[0]]
+
+      if is_efc:
+        nefc = d.nefc.numpy()[0]
+        nv = m.nv
+        d_arr = d_arr[:nefc]
+        d_arr = d_arr[d_sort].reshape(-1)
+        mjd_arr = mjd_arr[mjd_sort].reshape(-1)
 
       _assert_eq(d_arr, mjd_arr, arr)
 

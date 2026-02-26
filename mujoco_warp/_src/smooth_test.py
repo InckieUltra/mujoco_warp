@@ -25,6 +25,7 @@ import mujoco_warp as mjw
 from mujoco_warp import ConeType
 from mujoco_warp import DisableBit
 from mujoco_warp import test_data
+from mujoco_warp._src.util_pkg import check_version
 
 # tolerance for difference between MuJoCo and MJWarp smooth calculations - mostly
 # due to float precision
@@ -38,38 +39,122 @@ def _assert_eq(a, b, name):
 
 
 class SmoothTest(parameterized.TestCase):
-  def test_kinematics(self):
+  def test_mocap_kinematics(self):
+    """Tests that mocap bodies and child bodies are correctly updated after mocap_pos changes.
+
+    This is a regression test for a bug where mocap positions were updated after kinematics,
+    causing child bodies of mocap bodies to have incorrect positions based on stale mocap data.
+    """
+    # Create a simple scene with a mocap body that has a child body attached
+    xml = """
+    <mujoco>
+      <worldbody>
+        <body name="mocap_parent" mocap="true">
+          <geom type="sphere" size="0.1"/>
+          <body name="child" pos="1 0 0">
+            <geom type="box" size="0.1 0.1 0.1"/>
+            <site name="child_site" pos="0.5 0 0"/>
+          </body>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+
+    mjm, mjd, m, d = test_data.fixture(xml=xml)
+
+    self.assertEqual(m.nmocap, 1)
+
+    # Find mocap body and child body IDs
+    mocap_body_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "mocap_parent")
+    child_body_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "child")
+    child_site_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_SITE, "child_site")
+
+    # Initial kinematics
+    mjw.kinematics(m, d)
+    initial_mocap_xpos = d.xpos.numpy()[0, mocap_body_id]
+    initial_child_xpos = d.xpos.numpy()[0, child_body_id]
+    initial_site_xpos = d.site_xpos.numpy()[0, child_site_id].copy()
+
+    # Verify initial positions match MuJoCo
+    _assert_eq(d.xpos.numpy()[0], mjd.xpos, "initial xpos")
+
+    # Expected: child should be at mocap_pos + (1, 0, 0) relative offset
+    _assert_eq(initial_child_xpos, [1.0, 0.0, 0.0], "initial child xpos")
+    _assert_eq(initial_site_xpos, [1.5, 0.0, 0.0], "initial site xpos")
+
+    # Update mocap_pos to a new position
+    new_mocap_pos = np.array([[2.0, 3.0, 4.0]], dtype=np.float32)
+    d.mocap_pos.assign(new_mocap_pos)
+    mjd.mocap_pos[:] = new_mocap_pos
+
+    # Run kinematics again - this is the critical test
+    # Before the fix, this would compute child positions based on the OLD mocap position
+    mjw.kinematics(m, d)
+    mujoco.mj_kinematics(mjm, mjd)
+
+    # Check positions after update
+    updated_mocap_xpos = d.xpos.numpy()[0, mocap_body_id]
+    updated_child_xpos = d.xpos.numpy()[0, child_body_id]
+    updated_site_xpos = d.site_xpos.numpy()[0, child_site_id]
+
+    # Verify mocap body moved to new position
+    _assert_eq(updated_mocap_xpos, new_mocap_pos[0], "Mocap body should be at new position")
+
+    # KEY TEST: Child body should be at new_mocap_pos + (1, 0, 0)
+    expected_child_pos = new_mocap_pos[0] + np.array([1.0, 0.0, 0.0])
+    _assert_eq(updated_child_xpos, expected_child_pos, "Child body should be offset from NEW mocap position")
+
+    # Site should also be correctly positioned relative to new mocap position
+    expected_site_pos = new_mocap_pos[0] + np.array([1.5, 0.0, 0.0])
+    _assert_eq(updated_site_xpos, expected_site_pos, "Site should be offset from NEW mocap position")
+
+    # Verify matches MuJoCo reference
+    _assert_eq(d.xpos.numpy()[0], mjd.xpos, "updated xpos")
+    _assert_eq(d.site_xpos.numpy()[0], mjd.site_xpos, "updated site_xpos")
+
+  @parameterized.parameters(True, False)
+  def test_kinematics(self, make_data):
     """Tests kinematics."""
-    _, mjd, m, d = test_data.fixture("pendula.xml")
+    # TODO(team): improve batched Model field testing (eg, body_pos, body_quat, jnt_axis)
+    nworld = 2
+    mjm, mjd, m, d = test_data.fixture("pendula.xml", nworld=nworld, keyframe=0)
+    if make_data:
+      mjd = mujoco.MjData(mjm)
+      d = mjw.make_data(mjm, nworld=nworld)
 
-    for arr in (
-      d.xanchor,
-      d.xaxis,
-      d.xpos,
-      d.xquat,
-      d.xmat,
-      d.xipos,
-      d.ximat,
-      d.geom_xpos,
-      d.geom_xmat,
-      d.site_xpos,
-      d.site_xmat,
-    ):
-      arr.zero_()
+    for arr in (d.xpos, d.xipos, d.xquat, d.xmat, d.ximat, d.xanchor, d.xaxis, d.site_xpos, d.site_xmat):
+      arr_view = arr[:, 1:]  # skip world body
+      arr_view.fill_(wp.inf)
 
+    qpos = mjm.key_qpos[0]
+    mocap_pos = mjm.key_mpos[0]
+    mocap_quat = mjm.key_mquat[0]
+
+    mjd.qpos[:] = qpos
+    mjd.mocap_pos[:] = mocap_pos.reshape((mjm.nmocap, 3))
+    mjd.mocap_quat[:] = mocap_quat.reshape((mjm.nmocap, 4))
+
+    wp.copy(d.qpos, wp.array(np.tile(qpos, (nworld, 1)), shape=(nworld, mjm.nq), dtype=float))
+    wp.copy(d.mocap_pos, wp.array(np.tile(mocap_pos, (nworld, 1)), shape=(nworld, mjm.nmocap), dtype=wp.vec3))
+    wp.copy(d.mocap_quat, wp.array(np.tile(mocap_quat, (nworld, 1)), shape=(nworld, mjm.nmocap), dtype=wp.quat))
+
+    mujoco.mj_kinematics(mjm, mjd)
     mjw.kinematics(m, d)
 
-    _assert_eq(d.xanchor.numpy()[0], mjd.xanchor, "xanchor")
-    _assert_eq(d.xaxis.numpy()[0], mjd.xaxis, "xaxis")
-    _assert_eq(d.xpos.numpy()[0], mjd.xpos, "xpos")
-    _assert_eq(d.xquat.numpy()[0], mjd.xquat, "xquat")
-    _assert_eq(d.xmat.numpy()[0], mjd.xmat.reshape((-1, 3, 3)), "xmat")
-    _assert_eq(d.xipos.numpy()[0], mjd.xipos, "xipos")
-    _assert_eq(d.ximat.numpy()[0], mjd.ximat.reshape((-1, 3, 3)), "ximat")
-    _assert_eq(d.geom_xpos.numpy()[0], mjd.geom_xpos, "geom_xpos")
-    _assert_eq(d.geom_xmat.numpy()[0], mjd.geom_xmat.reshape((-1, 3, 3)), "geom_xmat")
-    _assert_eq(d.site_xpos.numpy()[0], mjd.site_xpos, "site_xpos")
-    _assert_eq(d.site_xmat.numpy()[0], mjd.site_xmat.reshape((-1, 3, 3)), "site_xmat")
+    for i in range(nworld):
+      _assert_eq(d.xanchor.numpy()[i], mjd.xanchor, "xanchor")
+      _assert_eq(d.xaxis.numpy()[i], mjd.xaxis, "xaxis")
+      _assert_eq(d.xpos.numpy()[i], mjd.xpos, "xpos")
+      _assert_eq(d.xquat.numpy()[i], mjd.xquat, "xquat")
+      _assert_eq(d.xmat.numpy()[i], mjd.xmat.reshape((-1, 3, 3)), "xmat")
+      _assert_eq(d.xipos.numpy()[i], mjd.xipos, "xipos")
+      _assert_eq(d.ximat.numpy()[i], mjd.ximat.reshape((-1, 3, 3)), "ximat")
+      _assert_eq(d.geom_xpos.numpy()[i], mjd.geom_xpos, "geom_xpos")
+      _assert_eq(d.geom_xmat.numpy()[i], mjd.geom_xmat.reshape((-1, 3, 3)), "geom_xmat")
+      _assert_eq(d.site_xpos.numpy()[i], mjd.site_xpos, "site_xpos")
+      _assert_eq(d.site_xmat.numpy()[i], mjd.site_xmat.reshape((-1, 3, 3)), "site_xmat")
+      _assert_eq(d.mocap_pos.numpy()[i], mjd.mocap_pos, "mocap_pos")
+      _assert_eq(d.mocap_quat.numpy()[i], mjd.mocap_quat, "mocap_quat")
 
   def test_com_pos(self):
     """Tests com_pos."""
@@ -113,7 +198,7 @@ class SmoothTest(parameterized.TestCase):
     else:
       qM = np.zeros((mjm.nv, mjm.nv))
       mujoco.mj_fullM(mjm, qM, mjd.qM)
-      _assert_eq(d.qM.numpy()[0], qM, "qM")
+      _assert_eq(d.qM.numpy()[0, : mjm.nv, : mjm.nv], qM, "qM")
 
   @parameterized.parameters(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE)
   def test_factor_m(self, jacobian):
@@ -227,11 +312,6 @@ class SmoothTest(parameterized.TestCase):
 
     d.cfrc_ext.zero_()
 
-    # clear equality constraint counts
-    d.ne_connect.zero_()
-    d.ne_weld.zero_()
-    d.ne_jnt.zero_()
-
     mjw.rne_postconstraint(m, d)
 
     _assert_eq(d.cfrc_ext.numpy()[0], mjd.cfrc_ext, "cfrc_ext (contact)")
@@ -253,7 +333,7 @@ class SmoothTest(parameterized.TestCase):
     mjm, mjd, m, d = test_data.fixture(xml)
 
     for arr in (d.actuator_length, d.actuator_moment):
-      arr.zero_()
+      arr.fill_(wp.inf)
 
     actuator_moment = np.zeros((mjm.nu, mjm.nv))
     mujoco.mju_sparse2dense(
@@ -273,8 +353,9 @@ class SmoothTest(parameterized.TestCase):
     """Tests adhesion actuator."""
     mjm, mjd, m, d = test_data.fixture("actuation/adhesion.xml", keyframe=keyframe, overrides={"opt.cone": cone})
 
-    d.actuator_length.zero_()
-    d.actuator_moment.zero_()
+    for arr in (d.actuator_length, d.actuator_moment):
+      arr.fill_(wp.inf)
+
     mjw._src.collision_driver.collision(m, d)  # compute contact.includemargin
     mjw._src.constraint.make_constraint(m, d)  # compute contact.efc_address
     mjw._src.smooth.transmission(m, d)
@@ -320,7 +401,12 @@ class SmoothTest(parameterized.TestCase):
     mjw.transmission(m, d)
 
     _assert_eq(d.ten_length.numpy()[0], mjd.ten_length, "ten_length")
-    _assert_eq(d.ten_J.numpy()[0], mjd.ten_J.reshape((mjm.ntendon, mjm.nv)), "ten_J")
+    if check_version("mujoco>=3.5.1.dev872479828"):
+      ten_J = np.zeros((mjm.ntendon, mjm.nv))
+      mujoco.mju_sparse2dense(ten_J, mjd.ten_J.reshape(-1), mjd.ten_J_rownnz, mjd.ten_J_rowadr, mjd.ten_J_colind.reshape(-1))
+    else:
+      ten_J = mjd.ten_J.reshape((mjm.ntendon, mjm.nv))
+    _assert_eq(d.ten_J.numpy()[0], ten_J, "ten_J")
     _assert_eq(d.wrap_xpos.numpy()[0], mjd.wrap_xpos, "wrap_xpos")
     _assert_eq(d.wrap_obj.numpy()[0], mjd.wrap_obj, "wrap_obj")
     _assert_eq(d.ten_wrapnum.numpy()[0], mjd.ten_wrapnum, "ten_wrapnum")
@@ -386,7 +472,7 @@ class SmoothTest(parameterized.TestCase):
 
     qM = np.zeros((mjm.nv, mjm.nv))
     mujoco.mj_fullM(mjm, qM, mjd.qM)
-    _assert_eq(d.qM.numpy()[0], qM, "qM")
+    _assert_eq(d.qM.numpy()[0, : mjm.nv, : mjm.nv], qM, "qM")
 
     # qfrc_bias
     d.qfrc_bias.zero_()
@@ -394,6 +480,44 @@ class SmoothTest(parameterized.TestCase):
     mjw._src.smooth.rne(m, d)
     mjw._src.smooth.tendon_bias(m, d, d.qfrc_bias)
     _assert_eq(d.qfrc_bias.numpy()[0], mjd.qfrc_bias, "qfrc_bias")
+
+  def test_flex(self):
+    mjm, mjd, m, d = test_data.fixture("flex/floppy.xml")
+    self.assertTrue(m.is_sparse)
+
+    d.flexvert_xpos.fill_(wp.inf)
+    d.flexedge_length.fill_(wp.inf)
+    d.flexedge_velocity.fill_(wp.inf)
+    d.flexedge_J.fill_(wp.inf)
+
+    mjw.kinematics(m, d)
+    mjw.com_pos(m, d)
+    mjw.flex(m, d)
+    mujoco.mj_kinematics(mjm, mjd)
+    mujoco.mj_comPos(mjm, mjd)
+    mujoco.mj_flex(mjm, mjd)
+
+    rownnz = mjm.flexedge_J_rownnz
+    rowadr = mjm.flexedge_J_rowadr
+    colind = mjm.flexedge_J_colind.reshape(-1)
+
+    mj_flexedge_J = np.zeros((mjm.nflexedge, mjm.nv), dtype=float)
+    mujoco.mju_sparse2dense(mj_flexedge_J, mjd.flexedge_J.ravel(), rownnz, rowadr, colind)
+
+    _assert_eq(d.flexvert_xpos.numpy()[0], mjd.flexvert_xpos, "flexvert_xpos")
+    _assert_eq(d.flexedge_length.numpy()[0], mjd.flexedge_length, "flexedge_length")
+    _assert_eq(d.flexedge_velocity.numpy()[0], mjd.flexedge_velocity, "flexedge_velocity")
+
+    flexedge_J = np.zeros((mjm.nflexedge, mjm.nv))
+    mujoco.mju_sparse2dense(
+      flexedge_J,
+      d.flexedge_J.numpy()[0, 0].reshape(-1),
+      m.flexedge_J_rownnz.numpy(),
+      m.flexedge_J_rowadr.numpy(),
+      m.flexedge_J_colind.numpy(),
+    )
+
+    _assert_eq(flexedge_J, mj_flexedge_J, "flexedge_J")
 
 
 if __name__ == "__main__":
