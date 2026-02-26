@@ -4,6 +4,9 @@
 # pip install --upgrade "jax[cuda12_local]"
 
 import os
+
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"  # preallocated 20% GPU memory
+
 import time
 
 import jax
@@ -19,13 +22,15 @@ import mujoco_warp as mjwarp
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_graph_min_graph_size=1"
 
-NWORLDS = 8192
+NWORLDS = 2048
 UNROLL_LENGTH = 1000
 
 wp.clear_kernel_cache()
 
-path = epath.resource_path("mujoco_warp") / "../benchmark" / "humanoid/humanoid.xml"
-mjm = mujoco.MjModel.from_xml_path(path.as_posix())
+# path = epath.resource_path("mujoco_warp") / "../benchmark" / "humanoid/humanoid.xml"
+# mjm = mujoco.MjModel.from_xml_path(path.as_posix())
+path = "/root/BioMJX/myo_sim/leg/myolegs_full.xml"
+mjm = mujoco.MjModel.from_xml_path(path)
 mjm.opt.iterations = 1
 mjm.opt.ls_iterations = 4
 mjd = mujoco.MjData(mjm)
@@ -34,7 +39,7 @@ mjd.qvel = np.random.uniform(-0.01, 0.01, mjm.nv)
 mujoco.mj_step(mjm, mjd, 3)  # let dynamics get state significantly non-zero
 mujoco.mj_forward(mjm, mjd)
 m = mjwarp.put_model(mjm)
-d = mjwarp.put_data(mjm, mjd, nworld=NWORLDS, nconmax=64 * NWORLDS, njmax=128)
+d = mjwarp.put_data(mjm, mjd, nworld=NWORLDS, nconmax=64, njmax=128)
 
 
 def warp_step(
@@ -57,8 +62,8 @@ warp_step_fn = jax_callable(
   output_dims={"qpos_out": (NWORLDS, mjm.nq), "qvel_out": (NWORLDS, mjm.nv)},
 )
 
-jax_qpos = jp.tile(jp.array(mjm.qpos0), (8192, 1))
-jax_qvel = jp.zeros((8192, m.nv))
+jax_qpos = jp.tile(jp.array(mjm.qpos0), (2048, 1))
+jax_qvel = jp.zeros(                    (2048, m.nv))
 
 
 def unroll(qpos, qvel):

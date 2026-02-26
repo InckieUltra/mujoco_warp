@@ -448,9 +448,10 @@ def wrap(
 
   return wlen, wpnt0, wpnt1
 
+from . import bezier_util
 
 @wp.func
-def muscle_gain_length(length: float, lmin: float, lmax: float) -> float:
+def muscle_gain_length(length: float, lmin: float = 0.4441, lmax: float = 1.8123, ltrans: float = 0.73) -> float:
   """Normalized muscle length-gain curve."""
   if (lmin > length) or (length > lmax):
     return 0.0
@@ -471,6 +472,33 @@ def muscle_gain_length(length: float, lmin: float, lmax: float) -> float:
   else:
     x = (lmax - length) / wp.max(MJ_MINVAL, lmax - b)
     return 0.5 * x * x
+
+  # if length < lmin or length > lmax:
+  #   return 0.0
+  # elif length <= ltrans:
+  #   length = 0.4441 + (0.73 - 0.4441) * (length - lmin) / (ltrans - lmin)
+  # else:
+  #   length = 0.73 + (1.8123 - 0.73) * (length - ltrans) / (lmax - ltrans)
+
+  # if length <= 0.444100:
+  #   return 0.0
+  # elif length <= 0.587050:
+  #   return bezier_util.calc_bezier(length, 0.444100, 0.469831, 0.471260, 0.478408, 0.484126, 0.587050,
+  #                                  0.000000, -0.000000, -0.000000, 0.020261, 0.040522, 0.405224,)
+  # elif length <= 0.840000:
+  #   return bezier_util.calc_bezier(length, 0.587050, 0.681707, 0.686966, 0.699613, 0.707002, 0.840000,
+  #                                  0.405224, 0.740633, 0.759267, 0.784267, 0.790633, 0.905224,)
+  # elif length <= 1.0:
+  #   return bezier_util.calc_bezier(length, 0.840000, 0.939000, 0.944500, 0.952500, 0.955000, 1.000000,
+  #                                  0.905224, 0.990522, 0.995261, 1.000000, 1.000000, 1.000000,)
+  # elif length <= 1.431150:
+  #   return bezier_util.calc_bezier(length, 1.000000, 1.067500, 1.071250, 1.092808, 1.110615, 1.431150,
+  #                                  1.000000, 1.000000, 1.000000, 0.975000, 0.950000, 0.500000,)
+  # elif length <= 1.812300:
+  #   return bezier_util.calc_bezier(length, 1.431150, 1.751685, 1.769493, 1.788550, 1.789800, 1.812300, 
+  #                                  0.500000, 0.050000, 0.025000, 0.000000, 0.000000, 0.000000,)
+  # else:
+  #   return 0.0
 
 
 @wp.func
