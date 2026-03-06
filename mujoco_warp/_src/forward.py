@@ -700,7 +700,7 @@ def fiber_bias(L: float, bias_lmax: float = 1.6, bias_fpmax: float = 1.0) -> flo
   
 
 @wp.func
-def tendon_force_length_curve(LT: float) -> float:
+def tendon_force_length_curve(LT: float, scale: float=1.0) -> float:
   # tendon length curve
   # x = LT
   # if LT <= 1.0:
@@ -725,8 +725,6 @@ def tendon_force_length_curve(LT: float) -> float:
   # else:
   #   FLT = 28.0612 * LT - 28.4361988
   # return FLT
-
-  scale = 3.0
 
   if LT <= 1.0:
     return 0.0
@@ -818,7 +816,7 @@ def fiber_bias_deriv(L: float, bias_lmax: float = 1.6, bias_fpmax: float = 1.0) 
     return - 2.86
   
 @wp.func
-def tendon_force_length_curve_deriv(LT: float) -> float:
+def tendon_force_length_curve_deriv(LT: float, scale: float = 1.0) -> float:
   # x = LT
   # if LT <= 1.0:
   #     return 0.0
@@ -844,8 +842,6 @@ def tendon_force_length_curve_deriv(LT: float) -> float:
   # else:
   #     return 28.0612
   # # return y
-
-  scale = 3.0
 
   if LT <= 1.0:
     return 0.0
@@ -877,6 +873,7 @@ def partial_func(
   passive_lmax: float,
   bias_fpmax: float,
   cos_phi: float,
+  tendon_softer: float,
 ) -> tuple[float, float, float, float, float, float, float, float]:
   dFL_dlceN = fiber_length_deriv(LceN, active_lmin, active_lmax, active_ltrans)
   if dFL_dlceN == 0.0:
@@ -895,8 +892,8 @@ def partial_func(
   # if abs(dfce_dlce) == 0.0:
   #   wp.printf("dfce_dlce == 0.0, fce: %f, dFL_dlceN: %f, V: %f, FV: %f, dbias_dlceN: %f, Lce0: %f, LceN: %f\n", 
   #             fce, dFL_dlceN, V, FV, dbias_dlceN, Lce0, LceN)
-  dft_dLt = -tendon_force_length_curve_deriv(LtN) * peak_force / Lt0
-  dft_dlce = -dft_dLt
+  dft_dLt = -tendon_force_length_curve_deriv(LtN, tendon_softer) * peak_force / Lt0
+  dft_dlce = -dft_dLt 
   dferr_dlce = dfceAT_dlce - dft_dlce
   
   return dFL_dlceN, dbias_dlceN, dfce_dlce, dft_dLt, dft_dlce, dferr_dlce, dfceAT_dlce, dfceAT_dlceAT
@@ -940,11 +937,13 @@ def elastic_tendon_mtu(
   ctrl_act = max(0.01, ctrl_act)
   beta = 0.01
 
-  ignore_elastic = 20.0
-
-  # if abs(peak_force - 1575.06) < 0.5 or abs(peak_force - 3115.51) < 0.5 or abs(peak_force - 6194.84) < 0.5:
-  #   ignore_elastic = 10.0
-  #   # peak_force = peak_force * 0.6667
+  # ignore_elastic = 20.0
+  tendon_softer = 1.0
+  if abs(peak_force - 1575.06) < 0.5 or abs(peak_force - 3115.51) < 0.5 or abs(peak_force - 6194.84) < 0.5:
+    # ignore_elastic = 10.0
+    # peak_force = peak_force * 0.0
+    tendon_softer = 1.0
+  peak_force *= 0.5
 
   # optimum length
   Lce0 = (lengthrange[1] - lengthrange[0]) / wp.max(MJ_MINVAL, range_[1] - range_[0])
@@ -956,6 +955,7 @@ def elastic_tendon_mtu(
   lce_h = Lce0 * wp.sin(pennation_angle_opt)
 
   if length < Lt0:
+    # wp.printf("length: %f, Lt0: %f\n, peak_force: %f", length, Lt0, gainprm[2])
     return 0.0
 
   max_lce = wp.sqrt(length*length + lce_h*lce_h) - 1e-3
@@ -1006,7 +1006,7 @@ def elastic_tendon_mtu(
 
   # length curve
   FL = fiber_length_curve(LceN, active_lmin, active_lmax, active_ltrans)
-  FLT = tendon_force_length_curve(LtN)
+  FLT = tendon_force_length_curve(LtN, tendon_softer)
   # FLT = fiber_bias(LtN, bias_lmax, bias_fpmax)
   bias = fiber_bias(LceN, passive_lmax, bias_fpmax)
 
@@ -1014,14 +1014,14 @@ def elastic_tendon_mtu(
   FV = fiber_velocity_curve(V, gain_fvmax)
 
   gain = -FL*FV
-  fce = (gain * ctrl_act + bias) * peak_force - beta * V
+  fce = (gain * ctrl_act + bias) * peak_force + beta * V
   ft = -FLT * peak_force
   fce_at = fce * cos_phi
   error = fce_at - ft
 
   dFL_dlceN, dbias_dlceN, dfce_dlce, dft_dLt, dft_dlce, dferr_dlce, dfceAT_dlce, dfceAT_dlceAT = partial_func(
     fce, lce, lce_h, Lce0, LceN, Lt0, LtN, FV, ctrl_act, peak_force, phi, active_lmin,
-    active_ltrans, active_lmax, passive_lmax, bias_fpmax, cos_phi,
+    active_ltrans, active_lmax, passive_lmax, bias_fpmax, cos_phi, tendon_softer,
   )
 
   # update velocity
@@ -1030,18 +1030,18 @@ def elastic_tendon_mtu(
   else:
     vt = velocity
   vce = (velocity - vt) * cos_phi
-  V = vce / wp.max(MJ_MINVAL, Lce0) / gain_vmax
+  V = vce / (wp.max(MJ_MINVAL, Lce0) * gain_vmax)
   FV = fiber_velocity_curve(V, gain_fvmax)
 
   gain = -FL*FV
-  fce = (gain * ctrl_act + bias) * peak_force - beta * V
+  fce = (gain * ctrl_act + bias) * peak_force + beta * V
   ft = -FLT * peak_force
   fce_at = fce * cos_phi
   error = fce_at - ft
 
   dFL_dlceN, dbias_dlceN, dfce_dlce, dft_dLt, dft_dlce, dferr_dlce, dfceAT_dlce, dfceAT_dlceAT = partial_func(
     fce, lce, lce_h, Lce0, LceN, Lt0, LtN, FV, ctrl_act, peak_force, phi, active_lmin,
-    active_ltrans, active_lmax, passive_lmax, bias_fpmax, cos_phi,
+    active_ltrans, active_lmax, passive_lmax, bias_fpmax, cos_phi, tendon_softer,
   )
 
   error_prev = error
@@ -1056,8 +1056,9 @@ def elastic_tendon_mtu(
     # wp.printf("%f\n", peak_force)
 
     h = float(1.0)
+    ls_iter = int(0)
 
-    while(True):
+    while(True and ls_iter < 6):
       delta_lce = - h * error_prev / dferr_dlce
 
       lce = lce_prev + delta_lce
@@ -1078,16 +1079,16 @@ def elastic_tendon_mtu(
 
       # length curve
       FL = fiber_length_curve(LceN, active_lmin, active_lmax, active_ltrans)
-      FLT = tendon_force_length_curve(LtN)
+      FLT = tendon_force_length_curve(LtN, tendon_softer)
       # FLT = fiber_bias(LtN, bias_lmax, bias_fpmax)
       bias = fiber_bias(LceN, passive_lmax, bias_fpmax)
 
-      V = vce / wp.max(MJ_MINVAL, Lce0) / gain_vmax
+      V = vce / (wp.max(MJ_MINVAL, Lce0) * gain_vmax)
       # velocity curve
       FV = fiber_velocity_curve(V, gain_fvmax)
       gain = -FL*FV
 
-      fce = (gain * ctrl_act + bias) * peak_force - beta * V
+      fce = (gain * ctrl_act + bias) * peak_force + beta * V
       fce_at = fce * cos_phi
       ft = -FLT * peak_force
 
@@ -1115,7 +1116,7 @@ def elastic_tendon_mtu(
 
         # length curve
         FL = fiber_length_curve(LceN, active_lmin, active_lmax, active_ltrans)
-        FLT = tendon_force_length_curve(LtN)
+        FLT = tendon_force_length_curve(LtN, tendon_softer)
         bias = fiber_bias(LceN, passive_lmax, bias_fpmax)
 
         V = vce / wp.max(MJ_MINVAL, Lce0) / gain_vmax
@@ -1123,7 +1124,7 @@ def elastic_tendon_mtu(
         FV = fiber_velocity_curve(V, gain_fvmax)
         gain = -FL*FV
 
-        fce = (gain * ctrl_act + bias) * peak_force - beta * V
+        fce = (gain * ctrl_act + bias) * peak_force + beta * V
         fce_at = fce * cos_phi
         ft = -FLT * peak_force
 
@@ -1133,6 +1134,8 @@ def elastic_tendon_mtu(
         break
 
       h *= 0.5
+
+      ls_iter += 1
 
     cur_iter += 1
 
@@ -1151,7 +1154,7 @@ def elastic_tendon_mtu(
 
     dFL_dlceN, dbias_dlceN, dfce_dlce, dft_dLt, dft_dlce, dferr_dlce, dfceAT_dlce, dfceAT_dlceAT = partial_func(
       fce, lce, lce_h, Lce0, LceN, Lt0, LtN, FV, ctrl_act, peak_force, phi, active_lmin,
-      active_ltrans, active_lmax, passive_lmax, bias_fpmax, cos_phi,
+      active_ltrans, active_lmax, passive_lmax, bias_fpmax, cos_phi, tendon_softer,
     )
 
     # update velocity
@@ -1174,30 +1177,40 @@ def elastic_tendon_mtu(
     #   # wp.printf("prm0: %f, prm1: %f, prm2: %f, prm3: %f, prm4: %f, prm5: %f, prm6: %f, prm7: %f, prm8: %f, prm9: %f\n\n",
     #   #           gainprm[0], gainprm[1], gainprm[2], gainprm[3], gainprm[4], gainprm[5], gainprm[6], gainprm[7], gainprm[8], gainprm[9])
 
+  if ignore_elastic > 15.0:
+    lce = length - Lt0
+    lce = max(min_lce, lce)
+    lce = min(max_lce, lce)
+    LceN = lce / wp.max(MJ_MINVAL, Lce0)
+    lce_w = wp.sqrt(lce * lce - lce_h * lce_h)
+    phi = wp.asin(lce_h / wp.max(MJ_MINVAL, lce))
+    cos_phi = wp.cos(phi)
+    vce = velocity * cos_phi
+    lt = length - lce_w
+    LtN = lt / wp.max(MJ_MINVAL, Lt0)
+
   # length curve
   FL = fiber_length_curve(LceN, active_lmin, active_lmax, active_ltrans)
-  FLT = tendon_force_length_curve(LtN)
+  FLT = tendon_force_length_curve(LtN, tendon_softer)
   bias = fiber_bias(LceN, passive_lmax, bias_fpmax)
 
-  if ignore_elastic > 15.0:
-    vce = velocity * cos_phi
-
-  V = vce / wp.max(MJ_MINVAL, Lce0) / gain_vmax
+  V = vce / (wp.max(MJ_MINVAL, Lce0) * gain_vmax)
   # velocity curve
   FV = fiber_velocity_curve(V, gain_fvmax)
   gain = -FL*FV
 
-  fce = (gain * ctrl_act + bias) * peak_force - beta * V
+  # bias = 0.0
+  fce = (gain * ctrl_act + bias) * peak_force + beta * V
   fceAT = fce * cos_phi
   ft = -FLT * peak_force
   old_error = error
   error = fceAT - ft
 
-  # if error > 1.0:
-  #   wp.printf("iter: %d, error: %f, peak force: %f, old_error: %f\n", cur_iter, error, peak_force, old_error)
-  #   # wp.printf("fl: %d, fv: %d, flt: %d, bias: %d\n", int(FL!=old_FL), int(FV!=old_FV), int(FLT!=old_FLT), int(bias!=old_bias))
+  # if error > 1.0 and ignore_elastic < 15.0:
+  #   wp.printf("iter: %d, error: %f, peak force: %f, old_error: %f\n", cur_iter, error, gainprm[2], old_error)
+  #   wp.printf("fl: %d, fv: %d, flt: %d, bias: %d\n", int(FL!=old_FL), int(FV!=old_FV), int(FLT!=old_FLT), int(bias!=old_bias))
 
-  # if wp.isnan(((gain * ctrl_act + bias) * peak_force - beta * V) * cos_phi):
+  # if wp.isnan(((gain * ctrl_act + bias) * peak_force + beta * V) * cos_phi):
   #   # wp.printf("NaN detected in muscle force computation!\n")
   #   wp.printf("iters: %d, error: %.15f, err_prev: %f, fce: %f, h: %.10f, dfce_dlce: %f, dft_dlce: %f, dft_dltN: %f, ltN: %f, length: %f, velocity: %f, lceN: %f, lce: %f, peak_force: %f, phi: %f, cosphi: %f\n\n", 
   #             cur_iter, error, error_prev, fce, h, dfce_dlce, dft_dlce, dft_dLt * Lt0, LtN, length, velocity, LceN, lce, peak_force, phi, cos_phi)
@@ -1651,13 +1664,13 @@ def elastic_tendon_mtu_analyse(
     pennation_angle_opt = 0.0
   # pennation_angle_opt = 0.0
   ctrl_act = max(0.01, ctrl_act)
-  beta = 0.0
+  beta = 0.01
 
   ignore_elastic = 20.0
 
-  # if abs(peak_force - 1575.06) < 0.5 or abs(peak_force - 3115.51) < 0.5 or abs(peak_force - 6194.84) < 0.5:
-  #   ignore_elastic = 10.0
-  #   # peak_force = peak_force * 0.6667
+  if abs(peak_force - 1575.06) < 0.5 or abs(peak_force - 3115.51) < 0.5 or abs(peak_force - 6194.84) < 0.5:
+    ignore_elastic = 10.0
+    # peak_force = peak_force * 0.6667
 
   # optimum length
   Lce0 = (lengthrange[1] - lengthrange[0]) / wp.max(MJ_MINVAL, range_[1] - range_[0])
@@ -1735,7 +1748,7 @@ def elastic_tendon_mtu_analyse(
     FV = fiber_velocity_curve(V, gain_fvmax)
     gain = -FL*FV
 
-    fce = (gain * ctrl_act + bias) * peak_force - beta * V
+    fce = (gain * ctrl_act + bias) * peak_force + beta * V
     ft = -FLT * peak_force
 
     fce_at = fce * cos_phi
@@ -1821,7 +1834,7 @@ def elastic_tendon_mtu_analyse(
       FV = fiber_velocity_curve(V, gain_fvmax)
       gain = -FL*FV
 
-      fce = (gain * ctrl_act + bias) * peak_force - beta * V
+      fce = (gain * ctrl_act + bias) * peak_force + beta * V
       fce_at = fce * cos_phi
       ft = -FLT * peak_force
 
@@ -1877,7 +1890,7 @@ def elastic_tendon_mtu_analyse(
   FV = fiber_velocity_curve(V, gain_fvmax)
   gain = -FL*FV
 
-  # if wp.isnan(((gain * ctrl_act + bias) * peak_force - beta * V) * cos_phi):
+  # if wp.isnan(((gain * ctrl_act + bias) * peak_force + beta * V) * cos_phi):
   #   wp.printf("NaN detected in muscle force computation!\n")
   #   wp.printf("iters: %d, error: %.15f, err_prev: %f, fce: %f, h: %.10f, dfce_dlce: %f, dft_dlce: %f, dft_dltN: %f, ltN: %f, length: %f, velocity: %f, lceN: %f, lce: %f, peak_force: %f, phi: %f, cosphi: %f\n\n", 
   #             cur_iter, error, error_prev, fce, h, dfce_dlce, dft_dlce, dft_dLt * Lt0, LtN, length, velocity, LceN, lce, peak_force, phi, cos_phi)
@@ -1886,7 +1899,7 @@ def elastic_tendon_mtu_analyse(
   if LtN < 0.8:
     print("Muscle analyse result -- iters:", cur_iter, "error:", error, "length:", length, "velocity:", velocity, "lceN:", LceN, "ltN:", LtN)
 
-  fce = (gain * ctrl_act + bias) * peak_force - beta * V
+  fce = (gain * ctrl_act + bias) * peak_force + beta * V
   ft = - FLT * peak_force
   ft = fce * cos_phi
 
